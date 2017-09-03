@@ -17,12 +17,14 @@
 # under the License.
 
 import sys
+import argparse
 from smbus import SMBus
 from contextlib import contextmanager
 
 # 
 # All register ceom from
 # https://github.com/torvalds/linux/blob/5924bbecd0267d87c24110cbe2041b5075173a25/drivers/hwmon/w83795.c
+# 
 #
 
 ADDRESS=0x2f
@@ -47,7 +49,13 @@ W83795_REG_CTFS = lambda index: 0x268 + index
 W83795_REG_FOPFP = lambda index: 0x218 + index
 #Fan Output Nonstop Value (FONV)
 W83795_REG_FONV = lambda index: 0x228 + index
+#Hystersis of Temperature (HT)
+W83795_REG_HT = lambda index: 0x270 + index
+#Target Temperature of Temperature Inputs
+W83795_TTTI = lambda index: 0x260 + index
 
+FANS = range(0,8)
+TEMPS = range(0,6)
 
 @contextmanager
 def bank(bus, value):
@@ -99,27 +107,34 @@ def to_perc(value):
   return value * 100 / 255
 
 
+def from_degree(value):
+  """Convert degree to hex"""
+  value = max(min(int(value) + 1,127),0)
+  return (value * 255 / 127) & 0xff
+
 def from_perc(value):
   """Convert perc to hex"""
+  value = max(min(int(value) + 1,100),0)
   return (value * 255 / 100) & 0xff
 
 
 def main():
   # Read arguments
-  args = sys.argv
-  pwm_value = None
-  if len(args)>1:
-    pwm_value = int(args[1])
+  parser = argparse.ArgumentParser(description='Change SuperMicro X8 Fan Control.')
+  parser.add_argument('-m', '--mode', type=str, choices=['smart', 'cruise'], help='Set the fan mode: smart or cruise. smart: to use Smart Fan mode. cruise: to use Thermal Cruise mode.')
+  parser.add_argument('-p', '--pwm', type=str, help='Set Fan Duty (in percentage).')
+  parser.add_argument('-t', '--temp', type=str, help='Set Temperature (in Celsius) associated to pwm.')
+  parser.add_argument('-H', '--hystersis', type=int, help='Set Hystersis value in degree (0-15)')
+  args = parser.parse_args()
 
+  # Open SMBus
+  try:
+    bus = SMBus(0)
+  except:
+    print("Failed to open i2c bus (/dev/i2d-0). Make sure i2c-dev module is loaded.")
+    return
   #Check if we have the right device.
   try:
-    # Open SMBus
-    try:
-      bus = SMBus(0)
-    except:
-      print("Failed to open i2c bus (/dev/i2d-0). Make sure i2c-dev module is loaded.")
-      return
-
     vendor = w83795_read(bus, 0xfd)
     chipid = w83795_read(bus, 0xfe)
     #debug("vendor %s, chipid %s" % (vendor, chipid))
@@ -128,49 +143,104 @@ def main():
       return
 
     # Check if Smarts Fan Control is enabled
-    fcms1 = w83795_read(bus, W83795_REG_FCMS1)
-    fcms2 = w83795_read(bus, W83795_REG_FCMS2) & 0xf
-    #debug("FCMDS1: %s, FCMS2: %s" % (fcms1, fcms2))
-    if fcms1 !=0 and fcms2 == 0:
-      print("Smart Fan Control is not enabled")
-      return
-    # Extract TEMP with Smart Fan Enabled
-    temps = [i for i in range(0,6) if fcms2 & (0x1<<i)]
+    if args.mode == 'smart':
+        # Check arguments
+        if not args.pwm or not args.temp:
+          print('pwm and temp are required')
+          return
+        pwm = args.pwm.split(',')
+        temp = args.temp.split(',')
+        if len(pwm) != len(temp):
+          print("pwm and temp must have the same number of values")
+          return
 
-    # Set the registry value
-    if pwm_value:
-      print("Set minimum PWM to %s%%" % pwm_value)
+        # Change Smart Fan Control value
+        for i in range(0,7):
+          p = pwm[i] if i < len(pwm) else pwm[-1]
+          tt = temp[i] if i < len(temp) else temp[-1]
+          print("Set Smart Fan Control %s%% - %sC" % (p, tt))
+          for t in TEMPS:
+            w83795_write(bus, W83795_REG_SFIV_DCPWM(t)[i], from_perc(p))
+            w83795_write(bus, W83795_REG_SFIV_TEMP(t)[i], from_degree(tt))
+
+        # Change Minimum PWM
+        for f in FANS:
+          w83795_write(bus, W83795_REG_FONV(f), from_perc(pwm[0]))
+        # Change critical Temp
+        for t in TEMPS:
+          w83795_write(bus, W83795_REG_CTFS(t), from_degree(temp[-1]))
+
+        # Set Smart Fan Control Mode T6FC - T1FC
+        w83795_write(bus, W83795_REG_FCMS1, 0x0)
+        w83795_write(bus, W83795_REG_FCMS2, 0x3f)
+
+    elif args.mode == 'cruise':
+        
+        # Check arguments
+        if not args.temp:
+          print('temp is required')
+          return
+        temp = int(args.temp)
+
+        print("Set Thermal Cruise %sC" % (temp,))
+        for t in TEMPS:
+          w83795_write(bus, W83795_TTTI(t), from_degree(temp))
+
+        # Change critical Temp
+        for t in TEMPS:
+          w83795_write(bus, W83795_REG_CTFS(t), from_degree(80))
+
+        # Set Thermal Cruise Mode.
+        w83795_write(bus, W83795_REG_FCMS1, 0x0)
+        w83795_write(bus, W83795_REG_FCMS2, 0x0)
+
+    # Set hystersis
+    if args.hystersis:
+      ht = max(min(args.hystersis,15),0)
+      print("Set hystersis %sC" % ht)
       # Change Smart Fan Control value
-      for t in temps:
-        w83795_write(bus, W83795_REG_SFIV_DCPWM(t)[0], from_perc(pwm_value))
-      # Change Minimum PWM
-      for f in range(0,6):
-        w83795_write(bus, W83795_REG_FONV(f), from_perc(pwm_value))
+      for t in range(0,6):
+        w83795_write(bus, W83795_REG_HT(t), ht)
 
-    for t in temps:
-      print("Temp%s:" % (t + 1))
-      print("  Smart Fan Control Table (SFIV)")
+    if args.mode or args.pwm or args.temp or args.hystersis:
+      return
+
+    # Check if Smarts Fan Control is enabled
+    fcms1 = w83795_read(bus, W83795_REG_FCMS1)
+    fcms2 = w83795_read(bus, W83795_REG_FCMS2) & 0xff
+
+    # Default to show all data.
+    for t in TEMPS:
+      print("Temp%s to Fan mapping Relationships (T%sFMR)" % (t+1, t+1))
+      tfmr = w83795_read(bus, W83795_REG_TFMR(t))
+      fans= [i+1 for i in FANS if tfmr & (0x1<<i)]
+      print(' '.join(['Fan%s' % i for i in fans]))
+
+      print("Smart Fan Control Table (SFIV)")
       temp = w83795_read(bus, W83795_REG_SFIV_TEMP(t))
       print(''.join([("%sC" % to_degree(v)).rjust(6) for v in temp]))
 
       dcpwm = w83795_read(bus, W83795_REG_SFIV_DCPWM(t))
       print(''.join([("%s%%" % to_perc(v)).rjust(6) for v in dcpwm]))
+
+      ttti = w83795_read(bus, W83795_TTTI(t))
+      print("Thermal Cruise (TTTI): %sC" % (ttti,))
+
+      ctfs = w83795_read(bus, W83795_REG_CTFS(t))
+      print("Critical Temperature (T%sCTFS): %sC" % (t, to_degree(ctfs)))
+
+      ht = w83795_read(bus, W83795_REG_HT(t)) & 0b1111
+      print("Hysteresis (HT%s): %sC" % (t, ht))
+
       print('')
 
-    for f in range(0,6):
-      print("Fan%s" % (f+1))
-      fonv = w83795_read(bus, W83795_REG_FONV(t))
-      print("  Fan Output Nonstop Value (FONV): %s%%" % to_perc(fonv))
+    for f in FANS:
+      fonv = w83795_read(bus, W83795_REG_FONV(f))
+      print("Fan%s Output Nonstop Value (F%sONV): %s%%" % (f+1, f+1, to_perc(fonv)))
 
-    #for t in range(0,6):
-    #  ctfs = w83795_read(bus, W83795_REG_CTFS(t))
-    #  print("T%sCTFS: %s" % (t, to_degree(ctfs)))
     #for f in range(0,6):
     #  w83795_write(bus, W83795_REG_FONV(f), 50)
-
     #w83795_write(bus, W83795_REG_SFIV_DCPWM(0)[0], 50)
-    #
-
     #w83795_write(bus, W83795_REG_SFIV_TEMP(0)[0], 85)
     #w83795_write(bus, W83795_REG_SFIV_TEMP(1)[0], 85)
 
